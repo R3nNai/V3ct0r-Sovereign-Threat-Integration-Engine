@@ -1,11 +1,11 @@
 import subprocess
 import re
+import asyncio
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List
-import time
 
-# --- DATA SCHEMAS (Pydantic Models) ---
+# --- DATA SCHEMAS ---
 class DiscoveredAsset(BaseModel):
     name: str
     cpe: str
@@ -17,7 +17,7 @@ class FlaggedThreat(BaseModel):
     cvss_score: float
     description: str
 
-# --- PHASE 1: LIVE ASSET DISCOVERY ---
+# --- PHASE 1: DISCOVERY (Kept synchronous for local system call) ---
 class DiscoveryEngine:
     def __init__(self):
         self.monitored_services = ["nginx", "openssh-server", "apache2", "curl"]
@@ -41,28 +41,32 @@ class DiscoveryEngine:
                 found_assets.append(DiscoveredAsset(name=product, cpe=cpe_string))
         return found_assets
 
-# --- PHASE 2: REAL-TIME THREAT THRESHOLDING ---
-class ThreatAnalyzerEngine:
+# --- PHASE 2: ASYNCHRONOUS THREAT ANALYSIS ---
+class AsyncThreatAnalyzer:
     def __init__(self):
         self.base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-    def query_nvd_for_asset(self, asset: DiscoveredAsset) -> List[FlaggedThreat]:
-        print(f"[*] PHASE 2: Dispatching query to NVD API for target profile: {asset.cpe}")
+    # Converted to an async coroutine using a shared client session
+    async def query_nvd_async(self, client: httpx.AsyncClient, asset: DiscoveredAsset) -> List[FlaggedThreat]:
+        print(f"[*] PHASE 2: Launching concurrent query for target: {asset.name}")
         prioritized_threats = []
         
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
-            # Pulling just 2 results per asset to respect API speed and rate limits
-            response = httpx.get(self.base_url, params={"cpeName": asset.cpe, "resultsPerPage": 2}, headers=headers, timeout=15.0)
+            # The 'await' keyword allows Python to pause this specific task and work on others while waiting for the network
+            response = await client.get(
+                self.base_url, 
+                params={"cpeName": asset.cpe, "resultsPerPage": 2}, 
+                headers=headers, 
+                timeout=10.0
+            )
             
             if response.status_code == 200:
                 vulnerabilities = response.json().get("vulnerabilities", [])
                 for item in vulnerabilities:
                     cve_wrapper = item.get("cve", {})
                     cve_id = cve_wrapper.get("id")
-                    
-                    descriptions = cve_wrapper.get("descriptions", [])
-                    desc_text = next((d.get("value") for d in descriptions if d.get("lang") == "en"), "")
+                    desc_text = next((d.get("value") for d in cve_wrapper.get("descriptions", []) if d.get("lang") == "en"), "")
                     
                     metrics = cve_wrapper.get("metrics", {})
                     cvss_v31 = metrics.get("cvssMetricV31", [])
@@ -71,62 +75,61 @@ class ThreatAnalyzerEngine:
                         score = cvss_data.get("baseScore", 0.0)
                         severity = cvss_data.get("baseSeverity", "UNKNOWN")
                         
-                        # PRIORITIZATION FILTER: Cut out low-impact bugs. Only escalate High/Critical metrics.
                         if score >= 7.0:
                             prioritized_threats.append(FlaggedThreat(
                                 cve_id=cve_id, asset_name=asset.name, severity=severity, cvss_score=score, description=desc_text
                             ))
+                print(f"  [✓] Completed query for: {asset.name} (Found {len(prioritized_threats)} high-risk CVEs)")
             return prioritized_threats
+            
         except Exception as e:
-            print(f"  [-] Connection gap during NVD lookup: {e}")
+            print(f"  [-] Network connection error on {asset.name}: {e}")
             return []
 
-# --- PHASE 3: AUTONOMOUS REMEDIATION ORCHESTRATOR ---
+# --- PHASE 3: INCIDENT RESPONSE ORCHESTRATOR ---
 class IncidentResponseOrchestrator:
     def trigger_mitigation_playbook(self, threat: FlaggedThreat):
         print(f"\n[!] PHASE 3: IR Orchestrator triggered for {threat.cve_id} ({threat.severity}) target: '{threat.asset_name}'")
-        
-        # Action Router Module based on context keywords
         if "http/2" in threat.description.lower():
-            print("  └─► Analysis: Threat targets HTTP/2 protocol multiplexing loops.")
-            print("  └─► REMEDIATION TASK: Stripping http2 parameters from local nginx directives...")
             print("  [✓] Complete: Service profiles hardened. Reloading server system configurations.")
         elif "buffer overflow" in threat.description.lower() or "remote code execution" in threat.description.lower():
-            print("  └─► Analysis: Critical execution vulnerability identified in base binary packages.")
-            print(f"  └─► REMEDIATION TASK: Forcing localized upstream package patch for system dependency '{threat.asset_name}'...")
             print(f"  [✓] Complete: apt-get package upgrade simulated safely for '{threat.asset_name}'.")
         else:
-            print(f"  └─► Analysis: Generic High-Impact attack vector. Queueing standard isolation protocols.")
-            print(f"  └─► REMEDIATION TASK: Updating host firewall configurations to rate-limit port access...")
             print("  [✓] Complete: Edge firewall baseline updated.")
 
-# --- MAIN CONTROLLER PIPELINE ---
-def main():
+# --- ASYNC MAIN CONTROLLER CONTEXT ---
+async def main_async():
     print("====================================================")
-    print("🔬 INITIALIZING SOVEREIGN THREAT INTEGRATION ENGINE 🔬")
+    print("🚀 INITIALIZING ASYNCHRONOUS SOVEREIGN SOAR CORE 🚀")
     print("====================================================\n")
     
-    # Initialize engines
     scanner = DiscoveryEngine()
-    analyzer = ThreatAnalyzerEngine()
+    analyzer = AsyncThreatAnalyzer()
     orchestrator = IncidentResponseOrchestrator()
     
-    # 1. Discover actual local system state
+    # 1. Gather our inventory state
     local_inventory = scanner.scan_local_host()
     
-    # 2. Feed discovered assets sequentially through analysis and triage routing
+    # 2. Fire ALL network API calls concurrently using an AsyncClient context
+    print(f"\n[*] Bundling {len(local_inventory)} asset paths into an asynchronous event loop...")
     all_escalated_threats = []
-    for asset in local_inventory:
-        live_cves = analyzer.query_nvd_for_asset(asset)
-        all_escalated_threats.extend(live_cves)
-
-        print("[*] Cooling down network socket for next query...")
-        time.sleep(6.0)
+    
+    async with httpx.AsyncClient() as client:
+        # Create a concurrent background task execution list for every single asset found
+        tasks = [analyzer.query_nvd_async(client, asset) for asset in local_inventory]
         
-    # 3. Process remediation tasks for any discovered vulnerabilities matching criteria
+        # 'gather' kicks off all background tasks simultaneously and awaits the combined results bundle
+        results = await asyncio.gather(*tasks)
+        
+        # Unpack the nested results lists
+        for threat_list in results:
+            all_escalated_threats.extend(threat_list)
+            
+    # 3. Process remediation actions sequentially for any true positives
     print(f"\n[*] Processing Triage Queue. Found {len(all_escalated_threats)} high-priority vectors matching local state.")
     for threat in all_escalated_threats:
         orchestrator.trigger_mitigation_playbook(threat)
 
 if __name__ == "__main__":
-    main()
+    # Start Python's native event loop to run the async application
+    asyncio.run(main_async())
